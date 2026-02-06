@@ -143,27 +143,30 @@ export class SQLiteStorage implements StorageBackend {
   async loadGraph(): Promise<KnowledgeGraph> {
     await this.initialize();
 
-    // Load entities with observations
-    const entityStmt = this.db.prepare(`
-      SELECT name, entity_type, GROUP_CONCAT(content, '\x00') as obs_contents
-      FROM entities e
-      LEFT JOIN observations o ON e.name = o.entity_name
-      GROUP BY e.name, e.entity_type
-    `);
+    // Load entities
+    const entityStmt = this.db.prepare('SELECT name, entity_type FROM entities');
+    const entityRows = entityStmt.all() as any[];
 
-    const entities: Entity[] = entityStmt.all().map((row: any) => ({
-      name: row.name,
-      entityType: row.entity_type,
-      observations: row.obs_contents ? row.obs_contents.split('\x00') : []
-    }));
+    // Load observations
+    const obsStmt = this.db.prepare('SELECT entity_name, content FROM observations');
+    const obsRows = obsStmt.all() as any[];
 
     // Load relations
     const relationStmt = this.db.prepare(`
-      SELECT from_entity as from, to_entity as to, relation_type as relationType
+      SELECT from_entity as "from", to_entity as "to", relation_type as "relationType"
       FROM relations
     `);
 
     const relations: Relation[] = relationStmt.all() as Relation[];
+
+    // Build entities with observations
+    const entities: Entity[] = entityRows.map((row) => ({
+      name: row.name,
+      entityType: row.entity_type,
+      observations: obsRows
+        .filter((obs) => obs.entity_name === row.name)
+        .map((obs) => obs.content)
+    }));
 
     return { entities, relations };
   }
