@@ -13,6 +13,14 @@ import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import minimist from 'minimist';
 import { isAbsolute } from 'path';
+import {
+  createStorageBackend,
+  getStorageType,
+  type StorageBackend,
+  type Entity,
+  type Relation,
+  type KnowledgeGraph
+} from './storage.js';
 
 // Read version from package.json - single source of truth
 // Path is '../package.json' because compiled code runs from dist/
@@ -44,6 +52,10 @@ if (memoryPath) {
 } else {
   baseMemoryPath = __dirname;
 }
+
+// Get storage backend type from environment variable
+const STORAGE_BACKEND = getStorageType();
+console.error(`Using storage backend: ${STORAGE_BACKEND}`);
 
 // Simple marker to identify our files - prevents writing to unrelated JSONL files
 const FILE_MARKER = {
@@ -81,12 +93,12 @@ function findProjectRoot(startDir: string = process.cwd()): string | null {
 // Function to get memory file path based on context and optional location override
 function getMemoryFilePath(context?: string, location?: 'project' | 'global'): string {
   const filename = context ? `memory-${context}.jsonl` : 'memory.jsonl';
-  
+
   // If location is explicitly specified, use it
   if (location === 'global') {
     return path.join(baseMemoryPath, filename);
   }
-  
+
   if (location === 'project') {
     const projectRoot = findProjectRoot();
     if (projectRoot) {
@@ -96,7 +108,7 @@ function getMemoryFilePath(context?: string, location?: 'project' | 'global'): s
       throw new Error('No project detected - cannot use project location');
     }
   }
-  
+
   // Auto-detect logic (existing behavior)
   const projectRoot = findProjectRoot();
   if (projectRoot) {
@@ -105,27 +117,15 @@ function getMemoryFilePath(context?: string, location?: 'project' | 'global'): s
       return path.join(aimDir, filename);
     }
   }
-  
+
   // Fallback to configured base directory
   return path.join(baseMemoryPath, filename);
 }
 
-// We are storing our memory using entities, relations, and observations in a graph structure
-interface Entity {
-  name: string;
-  entityType: string;
-  observations: string[];
-}
-
-interface Relation {
-  from: string;
-  to: string;
-  relationType: string;
-}
-
-interface KnowledgeGraph {
-  entities: Entity[];
-  relations: Relation[];
+// Helper to get storage backend for a given context/location
+function getStorageBackend(context?: string, location?: 'project' | 'global'): StorageBackend {
+  const filePath = getMemoryFilePath(context, location);
+  return createStorageBackend(filePath, STORAGE_BACKEND);
 }
 
 // Format a knowledge graph as human-readable text
@@ -166,54 +166,35 @@ function formatGraphPretty(graph: KnowledgeGraph, context?: string): string {
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 class KnowledgeGraphManager {
+  private migrationDone: Set<string> = new Set();
+
   private async loadGraph(context?: string, location?: 'project' | 'global'): Promise<KnowledgeGraph> {
     const filePath = getMemoryFilePath(context, location);
-    
-    try {
-      const data = await fs.readFile(filePath, "utf-8");
-      const lines = data.split("\n").filter(line => line.trim() !== "");
-      
-      if (lines.length === 0) {
-        return { entities: [], relations: [] };
+    const storage = getStorageBackend(context, location);
+
+    // Handle migration from JSONL to SQLite on first run
+    if (STORAGE_BACKEND === 'sqlite' && !this.migrationDone.has(filePath)) {
+      const jsonlPath = filePath;
+      const dbPath = filePath.replace(/\.jsonl$/, '.db');
+
+      // Migrate if JSONL exists and DB doesn't or is empty
+      if (existsSync(jsonlPath) && (!existsSync(dbPath) || (await fs.stat(dbPath)).size === 0)) {
+        console.error(`Migrating ${jsonlPath} to SQLite...`);
+        const sqliteStorage = storage as any; // Access SQLiteStorage methods
+        if (sqliteStorage.migrateFromJSONL) {
+          await sqliteStorage.migrateFromJSONL(jsonlPath);
+        }
+        this.migrationDone.add(filePath);
       }
-      
-      // Check first line for our file marker
-      const firstLine = JSON.parse(lines[0]!);
-      if (firstLine.type !== "_aim" || firstLine.source !== "mcp-knowledge-graph") {
-        throw new Error(`File ${filePath} does not contain required _aim safety marker. This file may not belong to the knowledge graph system. Expected first line: {"type":"_aim","source":"mcp-knowledge-graph"}`);
-      }
-      
-      // Process remaining lines (skip metadata)
-      return lines.slice(1).reduce((graph: KnowledgeGraph, line) => {
-        const item = JSON.parse(line);
-        if (item.type === "entity") graph.entities.push(item as Entity);
-        if (item.type === "relation") graph.relations.push(item as Relation);
-        return graph;
-      }, { entities: [], relations: [] });
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && (error as any).code === "ENOENT") {
-        // File doesn't exist - we'll create it with metadata on first save
-        return { entities: [], relations: [] };
-      }
-      throw error;
+      this.migrationDone.add(filePath);
     }
+
+    return storage.loadGraph();
   }
 
   private async saveGraph(graph: KnowledgeGraph, context?: string, location?: 'project' | 'global'): Promise<void> {
-    const filePath = getMemoryFilePath(context, location);
-    
-    // Write our simple file marker
-    
-    const lines = [
-      JSON.stringify(FILE_MARKER),
-      ...graph.entities.map(e => JSON.stringify({ type: "entity", ...e })),
-      ...graph.relations.map(r => JSON.stringify({ type: "relation", ...r })),
-    ];
-    
-    // Ensure directory exists
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    
-    await fs.writeFile(filePath, lines.join("\n"));
+    const storage = getStorageBackend(context, location);
+    await storage.saveGraph(graph);
   }
 
   async createEntities(entities: Entity[], context?: string, location?: 'project' | 'global'): Promise<Entity[]> {
@@ -339,6 +320,8 @@ class KnowledgeGraphManager {
       current_location: ""
     };
 
+    const fileExtension = STORAGE_BACKEND === 'sqlite' ? '.db' : '.jsonl';
+
     // Check project-local .aim directory
     const projectRoot = findProjectRoot();
     if (projectRoot) {
@@ -348,8 +331,13 @@ class KnowledgeGraphManager {
         try {
           const files = await fs.readdir(aimDir);
           result.project_databases = files
-            .filter(file => file.endsWith('.jsonl'))
-            .map(file => file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', ''))
+            .filter(file => file.endsWith(fileExtension))
+            .map(file => {
+              if (STORAGE_BACKEND === 'sqlite') {
+                return file === 'memory.db' ? 'default' : file.replace('memory-', '').replace('.db', '');
+              }
+              return file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', '');
+            })
             .sort();
         } catch (error) {
           // Directory exists but can't read - ignore
@@ -365,8 +353,13 @@ class KnowledgeGraphManager {
     try {
       const files = await fs.readdir(baseMemoryPath);
       result.global_databases = files
-        .filter(file => file.endsWith('.jsonl'))
-        .map(file => file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', ''))
+        .filter(file => file.endsWith(fileExtension))
+        .map(file => {
+          if (STORAGE_BACKEND === 'sqlite') {
+            return file === 'memory.db' ? 'default' : file.replace('memory-', '').replace('.db', '');
+          }
+          return file === 'memory.jsonl' ? 'default' : file.replace('memory-', '').replace('.jsonl', '');
+        })
         .sort();
     } catch (error) {
       // Directory doesn't exist or can't read
